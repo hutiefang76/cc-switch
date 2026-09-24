@@ -1547,6 +1547,7 @@ pub fn run() {
             commands::get_skill_backups,
             commands::delete_skill_backup,
             commands::install_skill_unified,
+            commands::adopt_local_skill,
             commands::uninstall_skill_unified,
             commands::restore_skill_backup,
             commands::toggle_skill_app,

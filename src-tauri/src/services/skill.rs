@@ -962,6 +962,112 @@ impl SkillService {
         Ok(installed_skill)
     }
 
+    /// Associate an identical local installation with a configured repository.
+    /// No Skill file or app deployment is written by this operation.
+    pub async fn adopt_local_skill(
+        &self,
+        db: &Arc<Database>,
+        local_id: &str,
+        skill: &DiscoverableSkill,
+    ) -> Result<InstalledSkill> {
+        if !local_id.starts_with("local:") {
+            return Err(anyhow!("Only local Skills can be adopted"));
+        }
+        let source_rel = Self::sanitize_skill_source_path(&skill.directory)
+            .ok_or_else(|| anyhow!("Invalid repository Skill directory"))?;
+        let install_name = source_rel
+            .file_name()
+            .and_then(|name| Self::sanitize_install_name(&name.to_string_lossy()))
+            .ok_or_else(|| anyhow!("Invalid repository Skill directory"))?;
+        let repo = db
+            .get_skill_repos()?
+            .into_iter()
+            .find(|repo| {
+                repo.enabled
+                    && repo.owner.eq_ignore_ascii_case(&skill.repo_owner)
+                    && repo.name.eq_ignore_ascii_case(&skill.repo_name)
+                    && repo.branch == skill.repo_branch
+            })
+            .ok_or_else(|| anyhow!("Skill repository is not enabled"))?;
+        let original = db
+            .get_installed_skill(local_id)?
+            .ok_or_else(|| anyhow!("Local Skill is no longer installed"))?;
+        if original.repo_owner.is_some()
+            || original.repo_name.is_some()
+            || !original.directory.eq_ignore_ascii_case(&install_name)
+        {
+            return Err(anyhow!(
+                "Local Skill does not match the repository directory"
+            ));
+        }
+        let directory = Self::require_valid_directory(&original.directory)?;
+        let (temp_guard, used_branch) = timeout(
+            std::time::Duration::from_secs(60),
+            self.download_repo(&repo),
+        )
+        .await
+        .map_err(|_| anyhow!("Timed out downloading Skill repository"))??;
+        let repo_root = temp_guard.path().canonicalize()?;
+        let source = Self::resolve_skill_source_dir(&repo_root, &skill.directory)
+            .ok_or_else(|| anyhow!("Skill not found in repository"))?
+            .canonicalize()?;
+        if !source.starts_with(&repo_root) || !source.is_dir() {
+            return Err(anyhow!("Invalid Skill source in repository"));
+        }
+        let doc_path = Self::doc_path_for_source(&repo_root, &source)
+            .ok_or_else(|| anyhow!("Invalid Skill source in repository"))?;
+        let (remote_name, remote_description) =
+            Self::read_skill_name_desc(&source.join("SKILL.md"), &install_name);
+        let remote_hash = Self::compute_pi_deployment_hash(&source)?;
+
+        // Re-read after the network operation and keep the lock through the
+        // comparison and metadata update. Coordinated Skill mutations cannot
+        // silently convert a different installation into a repository Skill.
+        let _state_guard = skill_state_write_guard();
+        let current = db
+            .get_installed_skill(local_id)?
+            .ok_or_else(|| anyhow!("Local Skill is no longer installed"))?;
+        if current.directory != original.directory
+            || current.installed_at != original.installed_at
+            || current.repo_owner.is_some()
+            || current.repo_name.is_some()
+        {
+            return Err(anyhow!("Local Skill changed during adoption"));
+        }
+        if !db.get_skill_repos()?.iter().any(|configured| {
+            configured.enabled
+                && configured.owner.eq_ignore_ascii_case(&repo.owner)
+                && configured.name.eq_ignore_ascii_case(&repo.name)
+                && configured.branch == repo.branch
+        }) {
+            return Err(anyhow!("Skill repository is no longer enabled"));
+        }
+        if current.name.trim() != remote_name.trim()
+            || current.description.as_deref().unwrap_or("").trim()
+                != remote_description.as_deref().unwrap_or("").trim()
+        {
+            return Err(anyhow!(
+                "Local Skill name or description does not match repository"
+            ));
+        }
+        let local_dir = Self::get_ssot_dir()?.join(directory);
+        if Self::compute_pi_deployment_hash(&local_dir)? != remote_hash {
+            return Err(anyhow!("Local Skill content does not match repository"));
+        }
+
+        let mut adopted = current;
+        adopted.repo_owner = Some(repo.owner.clone());
+        adopted.repo_name = Some(repo.name.clone());
+        adopted.repo_branch = Some(used_branch.clone());
+        adopted.readme_url =
+            Self::build_skill_doc_url(&repo.owner, &repo.name, &used_branch, &doc_path);
+        adopted.content_hash = Some(Self::compute_dir_hash(&local_dir)?);
+        if !db.update_skill_metadata(&adopted)? {
+            return Err(anyhow!("Local Skill is no longer installed"));
+        }
+        Ok(adopted)
+    }
+
     /// 卸载 Skill
     ///
     /// 流程：
@@ -6718,6 +6824,179 @@ mod tests {
             Some("skills"),
             "persisted source path should survive metadata changes and competing matches"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn adopt_local_skill_links_identical_repo_without_replacing_files_or_apps() {
+        let home = tempdir().expect("home");
+        let config_dir = home.path().join(".cc-switch");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::File::create(config_dir.join("cc-switch.db")).unwrap();
+        let _home = TestHomeGuard::set(home.path());
+        let _storage = StorageLocationGuard::set(SkillStorageLocation::CcSwitch);
+        let _pi_dir = crate::pi_config::test_support::TestAgentDir::new();
+        let remote = tempdir().expect("remote repo");
+        let remote_skill = remote.path().join("skills").join("demo");
+        write_skill(&remote_skill, "Demo");
+        fs::write(remote_skill.join("prompt.md"), "original").unwrap();
+
+        let db = Arc::new(Database::memory().unwrap());
+        db.save_skill_repo(&SkillRepo {
+            owner: "owner".to_string(),
+            name: "repo".to_string(),
+            branch: "main".to_string(),
+            enabled: true,
+        })
+        .unwrap();
+        let local = SkillService::get_ssot_dir().unwrap().join("demo");
+        write_skill(&local, "Demo");
+        fs::write(local.join("prompt.md"), "original").unwrap();
+        let mut installed = poisoned_skill("local:demo", "demo");
+        installed.name = "Demo".to_string();
+        installed.description = Some("Test skill".to_string());
+        installed.apps = SkillApps::only(&AppType::Codex);
+        installed.installed_at = 123;
+        db.save_skill(&installed).unwrap();
+
+        let service = SkillService {
+            repo_fixture: Some(remote.path().to_path_buf()),
+        };
+        let candidate = DiscoverableSkill {
+            key: "owner/repo:skills/demo".to_string(),
+            name: "Demo".to_string(),
+            description: "Test skill".to_string(),
+            directory: "skills/demo".to_string(),
+            readme_url: None,
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            repo_branch: "main".to_string(),
+        };
+        let adopted = service
+            .adopt_local_skill(&db, &installed.id, &candidate)
+            .await
+            .expect("adopt identical local skill");
+
+        assert_eq!(adopted.id, installed.id);
+        assert_eq!(adopted.apps, installed.apps);
+        assert_eq!(adopted.installed_at, installed.installed_at);
+        assert_eq!(adopted.repo_owner.as_deref(), Some("owner"));
+        assert_eq!(adopted.repo_branch.as_deref(), Some("main"));
+        assert_eq!(
+            adopted.readme_url.as_deref(),
+            Some("https://github.com/owner/repo/blob/main/skills/demo/SKILL.md")
+        );
+        assert_eq!(
+            fs::read_to_string(local.join("prompt.md")).unwrap(),
+            "original"
+        );
+        assert_eq!(db.get_all_installed_skills().unwrap().len(), 1);
+        assert!(service.check_updates(&db).await.unwrap().is_empty());
+
+        fs::write(remote_skill.join("prompt.md"), "new version").unwrap();
+        let updates = service.check_updates(&db).await.unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].id, installed.id);
+        service.update_skill(&db, &installed.id).await.unwrap();
+        assert_eq!(
+            fs::read_to_string(local.join("prompt.md")).unwrap(),
+            "new version"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn adopt_local_skill_rejects_modified_content_without_changing_installation() {
+        let home = tempdir().expect("home");
+        let config_dir = home.path().join(".cc-switch");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::File::create(config_dir.join("cc-switch.db")).unwrap();
+        let _home = TestHomeGuard::set(home.path());
+        let _storage = StorageLocationGuard::set(SkillStorageLocation::CcSwitch);
+        let remote = tempdir().expect("remote repo");
+        write_skill(&remote.path().join("demo"), "Demo");
+        let db = Arc::new(Database::memory().unwrap());
+        db.save_skill_repo(&SkillRepo {
+            owner: "owner".to_string(),
+            name: "repo".to_string(),
+            branch: "main".to_string(),
+            enabled: true,
+        })
+        .unwrap();
+        let local = SkillService::get_ssot_dir().unwrap().join("demo");
+        write_skill(&local, "Demo");
+        fs::write(local.join("local-only.md"), "keep me").unwrap();
+        let mut installed = poisoned_skill("local:demo", "demo");
+        installed.name = "Demo".to_string();
+        installed.description = Some("Test skill".to_string());
+        db.save_skill(&installed).unwrap();
+
+        let service = SkillService {
+            repo_fixture: Some(remote.path().to_path_buf()),
+        };
+        let candidate = DiscoverableSkill {
+            key: "owner/repo:demo".to_string(),
+            name: "Demo".to_string(),
+            description: "Test skill".to_string(),
+            directory: "demo".to_string(),
+            readme_url: None,
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            repo_branch: "main".to_string(),
+        };
+        let error = service
+            .adopt_local_skill(&db, &installed.id, &candidate)
+            .await
+            .expect_err("modified local skill must remain local");
+
+        assert!(error.to_string().contains("content"), "{error}");
+        assert_eq!(
+            db.get_installed_skill(&installed.id)
+                .unwrap()
+                .unwrap()
+                .repo_owner,
+            None
+        );
+        assert_eq!(
+            fs::read_to_string(local.join("local-only.md")).unwrap(),
+            "keep me"
+        );
+
+        fs::remove_file(local.join("local-only.md")).unwrap();
+        installed.description = Some("Different description".to_string());
+        db.save_skill(&installed).unwrap();
+        let error = service
+            .adopt_local_skill(&db, &installed.id, &candidate)
+            .await
+            .expect_err("metadata mismatch must remain local");
+        assert!(error.to_string().contains("description"), "{error}");
+        assert!(db
+            .get_installed_skill(&installed.id)
+            .unwrap()
+            .unwrap()
+            .repo_owner
+            .is_none());
+
+        installed.description = Some("Test skill".to_string());
+        db.save_skill(&installed).unwrap();
+        db.save_skill_repo(&SkillRepo {
+            owner: "owner".to_string(),
+            name: "repo".to_string(),
+            branch: "main".to_string(),
+            enabled: false,
+        })
+        .unwrap();
+        let error = service
+            .adopt_local_skill(&db, &installed.id, &candidate)
+            .await
+            .expect_err("disabled repository must not be adopted");
+        assert!(error.to_string().contains("not enabled"), "{error}");
+        assert!(db
+            .get_installed_skill(&installed.id)
+            .unwrap()
+            .unwrap()
+            .repo_owner
+            .is_none());
     }
 
     #[tokio::test]

@@ -64,6 +64,21 @@ pub async fn install_skill_unified(
         .map_err(|e| e.to_string())
 }
 
+/// Link an identical locally installed Skill to an enabled repository.
+#[tauri::command]
+pub async fn adopt_local_skill(
+    local_id: String,
+    skill: DiscoverableSkill,
+    service: State<'_, SkillServiceState>,
+    app_state: State<'_, AppState>,
+) -> Result<InstalledSkill, String> {
+    service
+        .0
+        .adopt_local_skill(&app_state.db, &local_id, &skill)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// 卸载 Skill（新版统一卸载）
 #[tauri::command]
 pub fn uninstall_skill_unified(

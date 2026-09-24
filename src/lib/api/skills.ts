@@ -167,6 +167,14 @@ export const skillsApi = {
     return await invoke("install_skill_unified", { skill, currentApp });
   },
 
+  /** Link an identical local Skill to a configured repository. */
+  async adoptLocal(
+    localId: string,
+    skill: DiscoverableSkill,
+  ): Promise<InstalledSkill> {
+    return await invoke("adopt_local_skill", { localId, skill });
+  },
+
   /** 卸载 Skill（统一卸载） */
   async uninstallUnified(id: string): Promise<SkillUninstallResult> {
     return await invoke("uninstall_skill_unified", { id });

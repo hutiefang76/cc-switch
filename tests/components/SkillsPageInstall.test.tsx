@@ -10,13 +10,16 @@ import {
 } from "@/components/skills/SkillsPage";
 import type {
   DiscoverableSkill,
+  InstalledSkill,
   SkillRepo,
   SkillsShDiscoverableSkill,
   SkillsShSearchResult,
 } from "@/lib/api/skills";
 
 const installMutateAsyncMock = vi.fn();
+const adoptMutateAsyncMock = vi.fn();
 let discoverableSkillsMock: DiscoverableSkill[] = [];
+let installedSkillsMock: InstalledSkill[] = [];
 let skillReposMock: SkillRepo[] = [];
 const refetchDiscoverableMock = vi.fn();
 
@@ -67,11 +70,14 @@ vi.mock("@/hooks/useSkills", () => ({
     refetch: refetchDiscoverableMock,
   }),
   useInstalledSkills: () => ({
-    data: [],
+    data: installedSkillsMock,
     isLoading: false,
   }),
   useInstallSkill: () => ({
     mutateAsync: installMutateAsyncMock,
+  }),
+  useAdoptLocalSkill: () => ({
+    mutateAsync: adoptMutateAsyncMock,
   }),
   useSkillRepos: () => ({
     data: skillReposMock,
@@ -130,7 +136,10 @@ describe("SkillsPage - skills.sh install (regression)", () => {
   beforeEach(() => {
     installMutateAsyncMock.mockReset();
     installMutateAsyncMock.mockResolvedValue({});
+    adoptMutateAsyncMock.mockReset();
+    adoptMutateAsyncMock.mockResolvedValue({});
     discoverableSkillsMock = [];
+    installedSkillsMock = [];
     skillReposMock = [];
     refetchDiscoverableMock.mockReset();
     searchCache.clear();
@@ -326,6 +335,43 @@ describe("SkillsPage - skills.sh install (regression)", () => {
 
     expect(screen.getByText("Repo Skill")).toBeInTheDocument();
     expect(onSourceChange).toHaveBeenCalledWith("repos");
+  });
+
+  it("offers explicit adoption for a matching local Skill instead of reinstalling it", async () => {
+    discoverableSkillsMock = [makeDiscoverableSkill()];
+    skillReposMock = [makeSkillRepo()];
+    installedSkillsMock = [
+      {
+        id: "local:repo-skill",
+        name: "Repo Skill",
+        description: "Skill from a configured repository",
+        directory: "repo-skill",
+        apps: {
+          claude: true,
+          codex: false,
+          gemini: false,
+          opencode: false,
+          openclaw: false,
+          hermes: false,
+          pi: false,
+        },
+        installedAt: 1,
+        updatedAt: 0,
+      },
+    ];
+
+    render(<SkillsPage initialApp="claude" />);
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "skills.adoptLocal" }));
+
+    await waitFor(() => {
+      expect(adoptMutateAsyncMock).toHaveBeenCalledWith({
+        localId: "local:repo-skill",
+        skill: discoverableSkillsMock[0],
+      });
+    });
+    expect(installMutateAsyncMock).not.toHaveBeenCalled();
   });
 
   it("exposes repository-only header actions for the parent chrome", () => {

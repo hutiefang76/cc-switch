@@ -100,6 +100,24 @@ export function useInstallSkill() {
   });
 }
 
+export function useAdoptLocalSkill() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      localId,
+      skill,
+    }: {
+      localId: string;
+      skill: DiscoverableSkill;
+    }) => skillsApi.adoptLocal(localId, skill),
+    onSettled: () =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["skills", "installed"] }),
+        queryClient.invalidateQueries({ queryKey: ["skills", "updates"] }),
+      ]),
+  });
+}
+
 /**
  * 卸载 Skill
  * 成功后直接移除已安装缓存，并在结束后收敛备份与未管理列表

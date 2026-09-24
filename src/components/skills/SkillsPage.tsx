@@ -29,6 +29,7 @@ import {
   useDiscoverableSkills,
   useInstalledSkills,
   useInstallSkill,
+  useAdoptLocalSkill,
   useSkillRepos,
   useAddSkillRepo,
   useRemoveSkillRepo,
@@ -153,6 +154,7 @@ export const SkillsPage = forwardRef<SkillsPageHandle, SkillsPageProps>(
 
     // Mutations
     const installMutation = useInstallSkill();
+    const adoptMutation = useAdoptLocalSkill();
     const addRepoMutation = useAddSkillRepo();
     const removeRepoMutation = useRemoveSkillRepo();
 
@@ -169,7 +171,10 @@ export const SkillsPage = forwardRef<SkillsPageHandle, SkillsPageProps>(
       );
     }, [installedSkills]);
 
-    type DiscoverableSkillItem = DiscoverableSkill & { installed: boolean };
+    type DiscoverableSkillItem = DiscoverableSkill & {
+      installed: boolean;
+      localSkillId?: string;
+    };
 
     // 从可发现技能中提取所有仓库选项
     const repoOptions = useMemo(() => {
@@ -193,12 +198,22 @@ export const SkillsPage = forwardRef<SkillsPageHandle, SkillsPageProps>(
           d.directory.toLowerCase();
         // 使用 directory + repoOwner + repoName 组合判断是否已安装
         const key = `${installName}:${d.repoOwner.toLowerCase()}:${d.repoName.toLowerCase()}`;
+        const localMatch = installedSkills?.find(
+          (installed) =>
+            installed.id.startsWith("local:") &&
+            !installed.repoOwner &&
+            !installed.repoName &&
+            installed.directory.toLowerCase() === installName &&
+            installed.name.trim() === d.name.trim() &&
+            (installed.description ?? "").trim() === d.description.trim(),
+        );
         return {
           ...d,
           installed: installedKeys.has(key),
+          localSkillId: localMatch?.id,
         };
       });
-    }, [discoverableSkills, installedKeys]);
+    }, [discoverableSkills, installedKeys, installedSkills]);
 
     // 检查 skills.sh 结果的安装状态
     const isSkillsShInstalled = (skill: SkillsShDiscoverableSkill): boolean => {
@@ -271,6 +286,24 @@ export const SkillsPage = forwardRef<SkillsPageHandle, SkillsPageProps>(
           duration: 10000,
         });
         console.error("Install skill failed:", error);
+      }
+    };
+
+    const handleAdopt = async (key: string, localId: string) => {
+      const skill = discoverableSkills?.find(
+        (candidate) => candidate.key === key,
+      );
+      if (!skill) {
+        toast.error(t("skills.notFound"));
+        return;
+      }
+      try {
+        await adoptMutation.mutateAsync({ localId, skill });
+        toast.success(t("skills.adoptLocalSuccess", { name: skill.name }));
+      } catch (error) {
+        toast.error(t("skills.adoptLocalFailed"), {
+          description: String(error),
+        });
       }
     };
 
@@ -565,6 +598,8 @@ export const SkillsPage = forwardRef<SkillsPageHandle, SkillsPageProps>(
                       key={skill.key}
                       skill={skill}
                       onInstall={handleInstall}
+                      localSkillId={skill.localSkillId}
+                      onAdopt={handleAdopt}
                       onUninstall={handleUninstall}
                     />
                   ))}

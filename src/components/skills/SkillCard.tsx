@@ -10,7 +10,7 @@ import {
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { ExternalLink, Download, Trash2, Loader2 } from "lucide-react";
+import { ExternalLink, Download, Trash2, Loader2, Link2 } from "lucide-react";
 import { settingsApi } from "@/lib/api";
 import type { DiscoverableSkill } from "@/lib/api/skills";
 
@@ -20,6 +20,8 @@ interface SkillCardProps {
   skill: SkillCardSkill;
   onInstall: (key: string) => Promise<void>;
   onUninstall: (key: string) => Promise<void>;
+  localSkillId?: string;
+  onAdopt?: (key: string, localSkillId: string) => Promise<void>;
   installs?: number;
 }
 
@@ -27,6 +29,8 @@ export function SkillCard({
   skill,
   onInstall,
   onUninstall,
+  localSkillId,
+  onAdopt,
   installs,
 }: SkillCardProps) {
   const { t } = useTranslation();
@@ -45,6 +49,16 @@ export function SkillCard({
     setLoading(true);
     try {
       await onUninstall(skill.key);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAdopt = async () => {
+    if (!localSkillId || !onAdopt) return;
+    setLoading(true);
+    try {
+      await onAdopt(skill.key, localSkillId);
     } finally {
       setLoading(false);
     }
@@ -144,6 +158,21 @@ export function SkillCard({
               <Trash2 className="h-3.5 w-3.5 mr-1.5" />
             )}
             {loading ? t("skills.uninstalling") : t("skills.uninstall")}
+          </Button>
+        ) : localSkillId && onAdopt ? (
+          <Button
+            variant="mcp"
+            size="sm"
+            onClick={handleAdopt}
+            disabled={loading}
+            className="flex-1"
+          >
+            {loading ? (
+              <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+            ) : (
+              <Link2 className="h-3.5 w-3.5 mr-1.5" />
+            )}
+            {loading ? t("skills.adoptingLocal") : t("skills.adoptLocal")}
           </Button>
         ) : (
           <Button
